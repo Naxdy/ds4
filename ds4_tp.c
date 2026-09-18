@@ -2388,6 +2388,11 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
     const uint64_t grace_ms =
         tp->opt.transport == DS4_TP_TRANSPORT_LOCAL ? 60000u : 2000u;
     if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms + grace_ms)) return 0;
+    if (getenv("DS4_TP_BIG_GATE_DEBUG") && getenv("DS4_TP_BIG_GATE_DEBUG")[0] == '3') {
+        fprintf(stderr, "ds4-tp: rank %d big gate enter l=%u seq=%llu bytes=%llu\n",
+                tp->rank, layer, (unsigned long long)seq,
+                (unsigned long long)bytes);
+    }
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     ds4_tp_gate_header ph;
     const bool header_ok = tp_write_full(tp->data_fd, &h, sizeof(h)) &&
