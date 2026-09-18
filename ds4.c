@@ -69204,6 +69204,11 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
     for (uint64_t i = 0; i < e->model.n_tensors; i++) {
         const ds4_tensor *t = &e->model.tensors[i];
         if (t->bytes == 0 || t == e->model.ngram_tensor) continue;
+        /* V4.1 Engram tables are disk-only (read by row, never resident);
+         * the weight spans exclude them, so budget math must too. */
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+            (ds4_streq(t->name, "blk.1.engram_embd.weight") ||
+             ds4_streq(t->name, "blk.14.engram_embd.weight"))) continue;
         int entry = tensor_to_entry(t, DS4_N_LAYER);
         if (entry < 0 || entry >= n_entries) entry = 0;
         if (cuda_tp_ep && engine_cuda_tp_output_env_requested() &&
