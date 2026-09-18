@@ -43,6 +43,10 @@ typedef struct {
 #endif
 
 int ds4_gpu_init(void);
+/* Select the physical device for the legacy single-GPU init.  The V4.1
+ * in-process tensor-parallel worker process targets its second GPU through
+ * this before engine open; the default (0) preserves every existing caller. */
+void ds4_gpu_set_preferred_device(int device);
 void ds4_gpu_cleanup(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);

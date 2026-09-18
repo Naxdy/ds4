@@ -101,6 +101,24 @@ int ds4_tp_create(
         size_t errlen);
 void ds4_tp_free(ds4_tp *tp);
 
+/* In-process CUDA tensor parallelism (DeepSeek V4.1 Flash on a two-GPU
+ * host).  A leader frontend calls this instead of creating its own network
+ * transport when --cuda-tensor-parallel requested exactly two CUDA devices:
+ * it picks a loopback port, spawns this same binary as the worker rank
+ * (second GPU, --role worker, --cuda-tensor-parallel removed) and binds the
+ * engine to the resulting leader transport, reusing the standard two-process
+ * TP protocol verbatim.  Returns 1 on success (engine bound, *tp set; the
+ * child is reaped by ds4_tp_free), 0 when this does not apply (caller keeps
+ * its existing path), -1 on failure (err filled).  The helper overrides
+ * `requested`'s role to LEADER; only its transport/rdma settings are reused,
+ * so callers must not set a role themselves. */
+int ds4_tp_local_leader_bind(ds4_engine *engine,
+                             const ds4_tp_options *requested,
+                             const char *worker_devices_arg,
+                             const char *worker_vram_arg,
+                             int argc, char **argv,
+                             ds4_tp **tp, char *err, size_t errlen);
+
 int ds4_tp_rank(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);

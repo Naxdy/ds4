@@ -1850,6 +1850,30 @@ requires updating all peers together, including Metal peers.
   prefix replay. A cancelled rank must not leave its peer's frontier valid.
   Repeat with `--tensor-parallel-cuda-small` for short-append boundaries;
   the control must mirror scalar execution on the worker as well.
+- **In-process V4.1 CUDA TP.** On a two-GPU host (build `make cuda
+  CUDA_ARCH=sm_120`, `./download_model.sh ds41f-q2`), require the leader
+  frontend alone to spawn the paired worker and agree with the network
+  pair:
+  ```sh
+  # CLI parity vs a single-GPU rank (both against the same Q2 GGUF):
+  ./ds4 --cuda --gpu-devices 0,1 --gpu-vram auto --cuda-tensor-parallel \
+    -m gguf/DeepSeek-V4.1-Flash-Q2.gguf --ctx 16384 -p "Plan." -n 24 --temp 0
+  # Server:
+  ./ds4-server --cuda --gpu-devices 1,0 --gpu-vram auto --cuda-tensor-parallel \
+    --ctx 16384 --batched-session 4 --host 127.0.0.1 --port 8123
+  # Agent:
+  ./ds4-agent --cuda --cuda-tensor-parallel --gpu-devices 0,1 --gpu-vram auto \
+    --ctx 16384 --non-interactive -p "Plan." -n 24
+  ```
+  The leader prints `ds4-tp: in-process V4.1 TP: worker rank spawned
+  (pid %ld) on device N` and binds a loopback transport; the worker is a
+  normal `--role worker` process, so it must pass every gate the network
+  pair does (RQ8-Q2 experts, no quality mode). Verify full-vocab logits,
+  session create/destroy, prefill chunking, cancellation and snapshots
+  agree with the two-machine run, and that Ctrl-C + immediate Ctrl-C
+  terminate both ranks without leaving a worker behind (`pgrep -f
+  "gpu-devices 1"` is empty when the leader exits).
+
 - Score general100, boundary17, medium continued12 and long continued9
   against the saved V4.1 API continuations. Include 32-token appends at
   sparse 8/16/32K frontiers. Compare paired case scores, not just coherent

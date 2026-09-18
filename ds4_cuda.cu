@@ -2855,10 +2855,20 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     return 1;
 }
 
+/* Physical device index for the legacy single-GPU init.  The in-process
+ * V4.1 tensor-parallel worker is a separate process whose only GPU is the
+ * second device; the engine open routes the requested device here before
+ * calling ds4_gpu_init(). Default 0 preserves all existing behavior. */
+static int g_init_device = 0;
+
+extern "C" void ds4_gpu_set_preferred_device(int device) {
+    if (device >= 0) g_init_device = device;
+}
+
 extern "C" int ds4_gpu_init(void) {
     ds4_gpu_config cfg;
     memset(&cfg, 0, sizeof(cfg));
-    cfg.device_indices[0] = 0;
+    cfg.device_indices[0] = g_init_device;
     cfg.n_gpus = 1;
     return ds4_gpu_init_multi(&cfg);
 }

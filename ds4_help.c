@@ -159,7 +159,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--gpu-vram N[,N,...]|auto", "CUDA VRAM budgets per device, in GiB, or auto-detect free VRAM.");
     opt(fp, c, "--gpu-devices N[,N,...]", "CUDA device indices used by multi-GPU placement.");
     if (tool != DS4_HELP_EVAL) {
-        opt(fp, c, "--cuda-tensor-parallel", "Enable the paired DeepSeek tensor/expert path on an even multi-GPU CUDA placement.");
+        opt(fp, c, "--cuda-tensor-parallel", "In-process tensor parallelism. DeepSeek V4 Flash: paired expert-split path on an even multi-GPU CUDA placement. DeepSeek V4.1 Flash: spawn a worker rank on a second CUDA GPU (exactly two devices, one per rank).");
     }
 #endif
     if (tool != DS4_HELP_BENCH) {

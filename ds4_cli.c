@@ -2297,6 +2297,13 @@ int main(int argc, char **argv) {
     cfg.engine.metal_graph_test = cfg.gen.metal_graph_test;
     cfg.engine.context_size = cfg.gen.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
+    /* In-process V4.1 tensor parallelism: --cuda-tensor-parallel with two
+     * CUDA devices runs each rank as its own single-GPU process.  These are
+     * filled from the resolved GPU config and consumed by the TP binder. */
+    bool local_tp_active = false;
+    char tp_worker_devices[32] = {0};
+    char tp_worker_vram_buf[32] = {0};
+    const char *tp_worker_vram = "auto";
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         ds4_gpu_config gpu_cfg = {0};
@@ -2326,6 +2333,17 @@ int main(int argc, char **argv) {
                                        layout, sizeof(layout)) > 0) {
                 fprintf(stdout, "%s\n", layout);
                 fflush(stdout);
+            }
+            if (cfg.engine.cuda_tensor_parallel && gpu_cfg.n_gpus == 2 &&
+                gpu_cfg.device_indices[0] != gpu_cfg.device_indices[1]) {
+                local_tp_active = true;
+                snprintf(tp_worker_devices, sizeof(tp_worker_devices), "%d",
+                         gpu_cfg.device_indices[1]);
+                if (cfg.gpu_vram_arg && strcmp(cfg.gpu_vram_arg, "auto") != 0) {
+                    snprintf(tp_worker_vram_buf, sizeof(tp_worker_vram_buf),
+                             "%zu", gpu_cfg.vram_bytes[1] / UINT64_C(1073741824));
+                    tp_worker_vram = tp_worker_vram_buf;
+                }
             }
             if (ds4_engine_create_with_gpu_config(&engine, &cfg.engine,
                                                    &gpu_cfg) != 0) {
@@ -2381,6 +2399,22 @@ int main(int argc, char **argv) {
             free(cfg.prompt_owned);
             return 1;
         }
+    } else if (local_tp_active) {
+        char tp_err[256] = "";
+        const int local_rc = ds4_tp_local_leader_bind(
+                engine, &cfg.engine.tp,
+                tp_worker_devices, tp_worker_vram,
+                argc, argv, &tp_leader, tp_err, sizeof(tp_err));
+        if (local_rc < 0) {
+            fprintf(stderr, "ds4: %s\n", tp_err);
+            ds4_tp_free(tp_leader);
+            ds4_engine_close(engine);
+            ds4_dist_options_free(cfg.dist);
+            free(cfg.prompt_owned);
+            return 1;
+        }
+        /* local_rc == 0: not a V4.1 pair (DeepSeek V4 Flash multi-GPU
+         * placement) — no transport is bound and nothing to do. */
     }
     if (cfg.dist && cfg.dist->role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options dist_gen = {

@@ -633,6 +633,12 @@ int main(int argc, char **argv) {
 
     ds4_gpu_config gpu_cfg = {0};
     bool skip_cuda = false;
+    /* In-process V4.1 tensor parallelism (--cuda-tensor-parallel with two
+     * CUDA devices) runs each rank as its own single-GPU process. */
+    bool local_tp_active = false;
+    char tp_worker_devices[32] = {0};
+    char tp_worker_vram_buf[32] = {0};
+    const char *tp_worker_vram = "auto";
     const bool have_gpu_config = cfg.gpu_vram_arg || cfg.gpu_devices_arg;
     if (have_gpu_config) {
         char gpu_err[256];
@@ -692,6 +698,17 @@ int main(int argc, char **argv) {
             fprintf(stdout, "%s\n", layout);
             fflush(stdout);
         }
+        if (cfg.cuda_tensor_parallel && gpu_cfg.n_gpus == 2 &&
+            gpu_cfg.device_indices[0] != gpu_cfg.device_indices[1]) {
+            local_tp_active = true;
+            snprintf(tp_worker_devices, sizeof(tp_worker_devices), "%d",
+                     gpu_cfg.device_indices[1]);
+            if (cfg.gpu_vram_arg && strcmp(cfg.gpu_vram_arg, "auto") != 0) {
+                snprintf(tp_worker_vram_buf, sizeof(tp_worker_vram_buf),
+                         "%zu", gpu_cfg.vram_bytes[1] / UINT64_C(1073741824));
+                tp_worker_vram = tp_worker_vram_buf;
+            }
+        }
         if (ds4_engine_create_with_gpu_config(
                 &engine, &opt, &gpu_cfg) != 0) return 1;
     } else if (ds4_engine_open(&engine, &opt) != 0) {
@@ -723,6 +740,19 @@ int main(int argc, char **argv) {
             close_engine(engine, tp_leader);
             return 1;
         }
+    } else if (local_tp_active) {
+        char local_err[256] = "";
+        const int local_rc = ds4_tp_local_leader_bind(
+                engine, &cfg.tp,
+                tp_worker_devices, tp_worker_vram,
+                argc, argv, &tp_leader, local_err, sizeof(local_err));
+        if (local_rc < 0) {
+            fprintf(stderr, "ds4-bench: %s\n", local_err);
+            close_engine(engine, tp_leader);
+            return 1;
+        }
+        /* local_rc == 0: not a V4.1 pair (DeepSeek V4 Flash multi-GPU
+         * placement) — no transport is bound and nothing to do. */
     }
     log_context_memory(opt.backend,
                        cfg.ctx_alloc,

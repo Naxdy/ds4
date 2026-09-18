@@ -168,6 +168,7 @@ int ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key) { (void)key; retur
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key) { (void)key; }
 void ds4_gpu_decode_graphs_invalidate(void) {}
 int ds4_gpu_set_current_device(int logical_tier) { (void)logical_tier; return -1; }
+void ds4_gpu_set_preferred_device(int device) { (void)device; }
 int ds4_gpu_set_current_device_fenced(int logical_tier) { (void)logical_tier; return -1; }
 void ds4_gpu_enable_q8_dequant_gemm(void) {}
 int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src, uint64_t bytes) { (void)dst; (void)src; (void)bytes; return 0; }
@@ -69513,6 +69514,20 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
 
     e->gpu_cfg = *cfg;
 
+    if (e->cuda_tensor_parallel &&
+        g_ds4_shape.family == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+        cfg->n_gpus >= 2) {
+        /* In-process V4.1 TP keeps each rank on ONE GPU: the leader engine
+         * executes entirely on tier 0 and the spawned worker is a separate
+         * single-GPU process, so there is no cross-tier layer placement to
+         * compute.  multi_tier stays 0, which routes the engine through the
+         * established single-device CUDA path unchanged. */
+        e->n_placement_entries = DS4_N_LAYER + 2;
+        for (int i = 0; i < e->n_placement_entries; i++) e->placement[i] = 0;
+        e->multi_tier = 0;
+        return 0;
+    }
+
     /* Pre-subtract per-tier Class-P graph scratch from EVERY device
      * budget BEFORE the packer reads vram_bytes.
      * Conservative: tiers that end up unused still reserve the overhead, so
@@ -70584,8 +70599,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
         const bool supported = (e->backend == DS4_BACKEND_METAL ||
 #if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__)
-                (e->backend == DS4_BACKEND_CUDA && !opt->cuda_tensor_parallel &&
-                 (!gpu_cfg || gpu_cfg->n_gpus <= 1)) ||
+                (e->backend == DS4_BACKEND_CUDA &&
+                 ((!opt->cuda_tensor_parallel &&
+                   (!gpu_cfg || gpu_cfg->n_gpus <= 1)) ||
+                  (opt->cuda_tensor_parallel && gpu_cfg &&
+                   gpu_cfg->n_gpus == 2))) ||
 #endif
                  false) &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE &&
@@ -70595,8 +70613,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
             (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
             e->power_percent == 100 && opt->context_size <= 1048576;
         if (!supported) {
-            fprintf(stderr, "ds4: V4.1 requires Metal or single-GPU CUDA per rank (optional network tensor parallelism); "
-                            "DSpark, steering and legacy diagnostics are not supported (maximum context 1048576)\n");
+            fprintf(stderr, "ds4: V4.1 requires Metal or single-GPU CUDA per rank (optional network or in-process "
+                            "two-GPU tensor parallelism); DSpark, steering and legacy diagnostics are "
+                            "not supported (maximum context 1048576)\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -70680,11 +70699,19 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (e->cuda_tensor_parallel &&
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
-        fprintf(stderr,
-                "ds4: --cuda-tensor-parallel is currently supported only for DeepSeek models\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
+        const bool v41_pair =
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+            e->backend == DS4_BACKEND_CUDA &&
+            gpu_cfg && gpu_cfg->n_gpus == 2;
+        if (!v41_pair) {
+            fprintf(stderr,
+                    "ds4: --cuda-tensor-parallel for DeepSeek V4.1 requires a CUDA build with "
+                    "exactly two GPUs (one GPU per rank); DeepSeek V4 Flash uses an even "
+                    "multi-GPU placement instead\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
     }
     if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {
         fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm\n");
@@ -70733,14 +70760,24 @@ static int ds4_engine_open_internal(ds4_engine **out,
      * immediately after binding so memory guards account only the bytes this
      * rank owns (replicated dense weights plus its expert shard). */
 #ifndef DS4_NO_GPU
+    /* In-process V4.1 TP (--cuda-tensor-parallel with exactly two CUDA
+     * devices) runs each rank as its own single-GPU process.  The leader
+     * takes the same sharded-weight layout as a network TP leader: dense
+     * weights replicated, one contiguous routed-expert half on disk. */
+    const bool v41_local_tp =
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+        opt->cuda_tensor_parallel &&
+        e->backend == DS4_BACKEND_CUDA &&
+        gpu_cfg && gpu_cfg->n_gpus == 2;
     const bool tp_shard =
-        opt->tp.role != DS4_TP_NONE &&
+        (opt->tp.role != DS4_TP_NONE || v41_local_tp) &&
         !e->ssd_streaming;
     const int tp_shard_rank = opt->tp.role == DS4_TP_WORKER ? 1 : 0;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (tp_shard && (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 ||
-        (gpu_cfg && gpu_cfg->n_gpus > 1) || opt->quality)) {
-        fprintf(stderr, "ds4: network CUDA TP currently requires V4.1 Q2, one GPU per rank, no quality mode\n");
+        (opt->tp.role != DS4_TP_NONE && gpu_cfg && gpu_cfg->n_gpus > 1) ||
+        opt->quality)) {
+        fprintf(stderr, "ds4: CUDA tensor parallelism requires V4.1 Q2, one GPU per rank, no quality mode\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -70750,7 +70787,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             if (e->weights.layer[il].ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
                 e->weights.layer[il].ffn_up_exps->type != DS4_TENSOR_IQ2_XXS ||
                 e->weights.layer[il].ffn_down_exps->type != DS4_TENSOR_Q2_K) {
-                fprintf(stderr, "ds4: network CUDA TP requires IQ2_XXS gate/up and Q2_K down experts\n");
+                fprintf(stderr, "ds4: CUDA tensor parallelism requires IQ2_XXS gate/up and Q2_K down experts\n");
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
@@ -71230,6 +71267,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
 
         /* Single-tier path (every existing caller). Body is byte-equivalent
          * to pre-multi-GPU CLI main. */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        /* The in-process V4.1 tensor-parallel rank is a single-GPU process:
+         * the worker opens the second listed device through this init, and
+         * the leader opens exactly the first listed device after the local
+         * rank was redirected to the single-device path. */
+        if (gpu_cfg &&
+            (gpu_cfg->n_gpus == 1 ||
+             (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+              opt->cuda_tensor_parallel && gpu_cfg->n_gpus == 2))) {
+            ds4_gpu_set_preferred_device(gpu_cfg->device_indices[0]);
+        }
+#endif
         e->metal_ready = ds4_gpu_init() != 0;
         if (!e->metal_ready) {
             fprintf(stderr, "ds4: %s backend unavailable; aborting startup\n",

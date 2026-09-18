@@ -10,8 +10,10 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -210,6 +212,9 @@ struct ds4_tp {
     uint64_t gate_timeout_ms;
     atomic_bool failed;
     uint64_t sync_checkpoint_seq;
+    /* Child process for the in-process V4.1 tensor-parallel worker rank
+     * (0 when this transport is a network pair). Reaped by ds4_tp_free. */
+    pid_t worker_pid;
 #ifdef DS4_TP_HAVE_VERBS
     ds4_tp_rdma rdma;
 #endif
@@ -2127,6 +2132,26 @@ void ds4_tp_free(ds4_tp *tp) {
 #endif
     if (tp->control_fd >= 0) close(tp->control_fd);
     if (tp->data_fd >= 0) close(tp->data_fd);
+    /* The in-process V4.1 worker rank is our child.  It exits by itself
+     * (STOP frame or EOF); bound the reap so a wedged child cannot hang
+     * shutdown. */
+    if (tp->worker_pid > 0) {
+        int status = 0;
+        for (int try = 0;; try++) {
+            const pid_t rc = waitpid(tp->worker_pid, &status,
+                                     try == 0 ? WNOHANG : 0);
+            if (rc == tp->worker_pid || (rc < 0 && errno == ECHILD)) break;
+            if (try >= 200) {   /* ~2 s */
+                (void)kill(tp->worker_pid, SIGKILL);
+            } else if (try % 10 == 9) {
+                (void)kill(tp->worker_pid, SIGTERM);
+            }
+            if (try >= 4000) break;   /* ~40 s hard stop */
+            struct timespec ts = {0, 10000000L};   /* 10 ms */
+            (void)nanosleep(&ts, NULL);
+        }
+        tp->worker_pid = -1;
+    }
     free(tp);
 }
 
@@ -3217,4 +3242,181 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
     ds4_engine_tp_unbind(engine);
     ds4_tp_free(tp);
     return rc;
+}
+
+/* ------------------------------------------------------------------------
+ * In-process CUDA tensor parallelism (DeepSeek V4.1 on a two-GPU host).
+ * --------------------------------------------------------------------- */
+
+/* Reserve an ephemeral loopback port so the spawned worker can dial the
+ * exact address this leader will listen on.  The small bind/release window
+ * is held by this single process (nothing else is dialing it), so reuse
+ * cannot be stolen in practice. */
+static int tp_pick_loopback_port(char *err, size_t errlen) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        tp_set_err(err, errlen, "tp: loopback probe socket: %s", strerror(errno));
+        return -1;
+    }
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int one = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(fd, 8) != 0) {
+        const int e = errno;
+        close(fd);
+        tp_set_err(err, errlen, "tp: loopback probe bind: %s", strerror(e));
+        return -1;
+    }
+    socklen_t alen = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr *)&addr, &alen) != 0) {
+        const int e = errno;
+        close(fd);
+        tp_set_err(err, errlen, "tp: loopback probe getsockname: %s", strerror(e));
+        return -1;
+    }
+    close(fd);
+    return ntohs(addr.sin_port);
+}
+
+/* Re-execute THIS binary as the TP worker rank: same model and options,
+ * pinned to the second GPU, dialing the leader loopback endpoint above.
+ * --cuda-tensor-parallel is removed so the worker takes the ordinary
+ * --role worker path (it never recurses into another in-process spawn). */
+static pid_t tp_spawn_worker(int port,
+                             const char *worker_devices_arg,
+                             const char *worker_vram_arg,
+                             int argc, char **argv,
+                             char *err, size_t errlen) {
+    char exe[4096];
+    const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0 || n >= (ssize_t)(sizeof(exe) - 1)) {
+        tp_set_err(err, errlen, "tp: cannot resolve own executable: %s",
+                   strerror(errno));
+        return -1;
+    }
+    exe[n] = '\0';
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        tp_set_err(err, errlen, "tp: worker fork failed: %s", strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        int cap = argc + 20;
+        char **wargv = calloc((size_t)cap + 1, sizeof(*wargv));
+        if (!wargv) _exit(127);
+        int out = 0;
+        wargv[out++] = exe;
+        for (int i = 1; i < argc; i++) {
+            if (!strcmp(argv[i], "--cuda-tensor-parallel")) continue;
+            wargv[out++] = argv[i];
+        }
+        char portstr[16] = {0};
+        snprintf(portstr, sizeof(portstr), "%d", port);
+        wargv[out++] = "--tensor-parallel";
+        wargv[out++] = "--role";
+        wargv[out++] = "worker";
+        wargv[out++] = "--coordinator";
+        wargv[out++] = "127.0.0.1";
+        wargv[out++] = portstr;
+        wargv[out++] = "--gpu-devices";
+        wargv[out++] = (char *)(worker_devices_arg ? worker_devices_arg : "1");
+        wargv[out++] = "--gpu-vram";
+        wargv[out++] = (char *)(worker_vram_arg && worker_vram_arg[0]
+                                ? worker_vram_arg : "auto");
+        wargv[out] = NULL;
+        /* A terminal Ctrl+C signals the whole foreground process group.
+         * Only the leader handles it (STOP then clean shutdown); the worker
+         * must not be killed mid-gate. It exits via the STOP frame, or on
+         * EOF / SIGKILL when the leader dies abruptly. Ignored dispositions
+         * survive execv. */
+        (void)signal(SIGINT, SIG_IGN);
+        execv(exe, wargv);
+        fprintf(stderr, "ds4-tp: worker exec %s failed: %s\n", exe,
+                strerror(errno));
+        _exit(127);
+    }
+    fprintf(stderr, "ds4-tp: in-process V4.1 TP: worker rank spawned (pid %ld) "
+                    "on device %s\n", (long)pid, worker_devices_arg);
+    return pid;
+}
+
+/* SIGALRM for the pairing timeout: accept() is interrupted with EINTR
+ * instead of the process dying on the default action. */
+static void tp_pair_alarm(int sig) { (void)sig; }
+
+int ds4_tp_local_leader_bind(ds4_engine *engine, const ds4_tp_options *requested,
+                             const char *worker_devices_arg,
+                             const char *worker_vram_arg,
+                             int argc, char **argv,
+                             ds4_tp **tp, char *err, size_t errlen) {
+    *tp = NULL;
+    if (!engine || !requested || !worker_devices_arg ||
+        !ds4_engine_is_deepseek41(engine)) {
+        return 0;   /* not an in-process V4.1 pair */
+    }
+    const int port = tp_pick_loopback_port(err, errlen);
+    if (port <= 0) return -1;
+    const pid_t pid = tp_spawn_worker(port, worker_devices_arg,
+                                      worker_vram_arg, argc, argv, err, errlen);
+    if (pid < 0) return -1;
+
+    ds4_tp_options opt = *requested;
+    opt.requested = true;
+    opt.role = DS4_TP_LEADER;
+    opt.listen_host = "127.0.0.1";
+    opt.listen_port = port;
+    /* Loopback has no NIC; TCP is always functional and cheaper for these
+     * messages than RDMA. Only an explicit --transport rdma overrides. */
+    if (opt.transport == DS4_TP_TRANSPORT_AUTO) opt.transport = DS4_TP_TRANSPORT_TCP;
+
+    ds4_tp_identity id = {
+        .gguf_bytes = ds4_engine_model_bytes(engine),
+        .model_id = (uint32_t)ds4_engine_model_id(engine),
+        .n_layer = (uint32_t)ds4_engine_layer_count(engine),
+        .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
+        .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
+        .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+        .ctx_size = 0,   /* adopted from the leader's sessions */
+    };
+    ds4_engine_tp_gate_schedule(engine,
+                                &id.gate_slot_start,
+                                &id.gate_slot_step,
+                                &id.gates_per_token,
+                                id.gate_slot_mask);
+
+    struct sigaction old_action = {0}, alarm_action = {0};
+    alarm_action.sa_handler = tp_pair_alarm;
+    sigemptyset(&alarm_action.sa_mask);
+    (void)sigaction(SIGALRM, &alarm_action, &old_action);
+    /* Fail fast if the spawned worker errored during exec/startup instead
+     * of letting accept() wait out the pairing alarm. This waitpid reaps it,
+     * so no zombie survives. */
+    {
+        int wstatus = 0;
+        if (waitpid(pid, &wstatus, WNOHANG) == pid) {
+            (void)alarm(0);
+            (void)sigaction(SIGALRM, &old_action, NULL);
+            tp_set_err(err, errlen,
+                       "tp: worker rank exited during startup%s",
+                       WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 0
+                           ? " (see its stderr above)" : "");
+            return -1;
+        }
+    }
+    (void)alarm(600);
+    const int created = ds4_tp_create(tp, &opt, &id, err, errlen);
+    (void)alarm(0);
+    (void)sigaction(SIGALRM, &old_action, NULL);
+    if (!created) return -1;
+    (*tp)->worker_pid = pid;
+    if (!ds4_engine_tp_bind(engine, *tp, err, errlen)) {
+        ds4_tp_free(*tp);
+        *tp = NULL;
+        return -1;
+    }
+    return 1;
 }
