@@ -2103,6 +2103,16 @@ int ds4_tp_create(
             tp_set_err(err, errlen, "tp: local twin missing socket fds");
             goto fail;
         }
+        /* socketpairs do not autotune like loopback TCP: a big-gate payload
+         * round (up to 2 MiB) would deadlock both ranks writing into a
+         * default ~212 KiB buffer, each waiting for the other to read.
+         * Give both directions of BOTH sockets room for a full round. */
+        for (int fd = 0; fd < 2; fd++) {
+            const int s = fd == 0 ? tp->control_fd : tp->data_fd;
+            const int buf = 16 * 1024 * 1024;
+            (void)setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+            (void)setsockopt(s, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+        }
     }
     if (!local) tp_socket_tune(tp->control_fd);
 
@@ -2371,8 +2381,13 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
 #endif
     /* A cold prefill kernel can make one rank arrive much later than the
      * other. Match the bulk RDMA window's bounded grace, without relaxing
-     * the decode timeout or any subsequent payload exchange. */
-    if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms + 2000u)) return 0;
+     * the decode timeout or any subsequent payload exchange. The in-process
+     * twin runs a full 254B-rank prefill between gates on its own GPU, so
+     * allow a generous grace there (the lockstep gates themselves are the
+     * real pacing; the timeout only guards a wedged peer). */
+    const uint64_t grace_ms =
+        tp->opt.transport == DS4_TP_TRANSPORT_LOCAL ? 60000u : 2000u;
+    if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms + grace_ms)) return 0;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     ds4_tp_gate_header ph;
     const bool header_ok = tp_write_full(tp->data_fd, &h, sizeof(h)) &&
