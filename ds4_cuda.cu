@@ -33663,98 +33663,112 @@ extern "C" int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *te
                    "selected tensor read");
 }
 
-/* Per-thread TP gate service state. In the in-process V4.1 tensor
- * parallelism the leader engine's gates and the mirrored worker engine's
- * gates run on TWO threads of the same process (each pinned to its own
- * CUDA device); the exchange callbacks, sequence counters and bulk
- * staging must never be shared between them. */
-static thread_local struct {
+/* TP gate service state, one slot per rank. In the in-process V4.1 tensor
+ * parallelism both ranks live in this process: the leader's gates run on
+ * whichever thread drives the engine (the server's request handlers, not
+ * just the thread that bound the transport), while the mirrored worker's
+ * gates run on its own thread. The binding thread records its rank in a
+ * thread-local; any thread that never bound (leader-side request
+ * handlers) defaults to rank 0. The exchange callbacks, sequence counters
+ * and bulk staging are therefore per-rank, never per-thread. */
+struct cuda_tp_state {
     ds4_gpu_tp_exchange_fn row;
     ds4_gpu_tp_batch_exchange_fn batch;
     ds4_gpu_tp_big_exchange_fn big;
     void *ud, *staging;
     uint64_t vec_bytes, staging_bytes, row_seq, batch_seq;
     bool failed;
-} g_cuda_tp;
+};
+static struct cuda_tp_state g_cuda_tp[2];
+static thread_local int g_cuda_tp_rank = -1;
+
+static struct cuda_tp_state *cuda_tp_this(void) {
+    return &g_cuda_tp[g_cuda_tp_rank >= 0 ? g_cuda_tp_rank : 0];
+}
 
 extern "C" void ds4_gpu_tp_shutdown(void) {
-    if (g_cuda_tp.row) (void)cudaDeviceSynchronize();
-    if (g_cuda_tp.staging) (void)cudaFreeHost(g_cuda_tp.staging);
-    g_cuda_tp = {};
+    struct cuda_tp_state *s = cuda_tp_this();
+    if (s->row) (void)cudaDeviceSynchronize();
+    if (s->staging) (void)cudaFreeHost(s->staging);
+    *s = {};
 }
 
 extern "C" int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
         uint64_t gpu_flags_off, uint64_t out_off, uint64_t vec_bytes,
         ds4_gpu_tp_exchange_fn fn, void *ud) {
-    if (g_cuda_tp.row || rank > 1 || !slab || !fn || !vec_bytes ||
+    if (rank > 1 || g_cuda_tp[rank].row || !slab || !fn || !vec_bytes ||
         out_off > slab->bytes || vec_bytes > slab->bytes - out_off ||
         gpu_flags_off >= slab->bytes) return 0;
-    g_cuda_tp.row = fn;
-    g_cuda_tp.ud = ud;
-    g_cuda_tp.vec_bytes = vec_bytes;
+    g_cuda_tp_rank = (int)rank;
+    g_cuda_tp[rank].row = fn;
+    g_cuda_tp[rank].ud = ud;
+    g_cuda_tp[rank].vec_bytes = vec_bytes;
     return 1;
 }
 
 extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
-    g_cuda_tp.batch = fn;
+    cuda_tp_this()->batch = fn;
 }
 
 extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {
-    g_cuda_tp.big = fn;
+    cuda_tp_this()->big = fn;
 }
 
 extern "C" void ds4_gpu_tp_set_session_batch_mode(int enabled) { (void)enabled; }
 extern "C" int ds4_gpu_tp_decode_split_flush_safe(void) { return 1; }
 
 extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
-    if (!g_cuda_tp.row || g_cuda_tp.failed) return 0;
+    struct cuda_tp_state *s = cuda_tp_this();
+    if (!s->row || s->failed) return 0;
     /* Do not leave a GPU polling kernel waiting for a remote process. */
     const int ok = cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "TP row arrival") &&
-        g_cuda_tp.row(g_cuda_tp.ud, layer, gate, ++g_cuda_tp.row_seq);
-    if (!ok) g_cuda_tp.failed = true;
+        s->row(s->ud, layer, gate, ++s->row_seq);
+    if (!ok) s->failed = true;
     return ok;
 }
 
 extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
-    if (!g_cuda_tp.row || !g_cuda_tp.batch || g_cuda_tp.failed || !rows || rows > 8) return 0;
+    struct cuda_tp_state *s = cuda_tp_this();
+    if (!s->row || !s->batch || s->failed || !rows || rows > 8) return 0;
     const int ok = cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "TP batch arrival") &&
-        g_cuda_tp.batch(g_cuda_tp.ud, layer, rows, ++g_cuda_tp.batch_seq);
-    if (!ok) g_cuda_tp.failed = true;
+        s->batch(s->ud, layer, rows, ++s->batch_seq);
+    if (!ok) s->failed = true;
     return ok;
 }
 
 extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
         const ds4_gpu_tensor *out_t, ds4_gpu_tensor *in_t, uint64_t bytes) {
+    struct cuda_tp_state *s = cuda_tp_this();
     if (getenv("DS4_TP_BIG_GATE_DEBUG") && getenv("DS4_TP_BIG_GATE_DEBUG")[0] == '3' &&
-        (!g_cuda_tp.row || !g_cuda_tp.big || g_cuda_tp.failed || !out_t || !in_t ||
-         !rows || bytes != (uint64_t)rows * g_cuda_tp.vec_bytes)) {
-        fprintf(stderr, "ds4-tp: rank? big encode BAIL l=%u rows=%u bytes=%llu vec=%llu row=%d big=%d failed=%d out=%d in=%d\n",
-                layer, rows, (unsigned long long)bytes,
-                (unsigned long long)g_cuda_tp.vec_bytes,
-                g_cuda_tp.row != NULL, g_cuda_tp.big != NULL,
-                g_cuda_tp.failed, out_t != NULL, in_t != NULL);
+        (!s->row || !s->big || s->failed || !out_t || !in_t ||
+         !rows || bytes != (uint64_t)rows * s->vec_bytes)) {
+        fprintf(stderr, "ds4-tp: rank %d big encode BAIL l=%u rows=%u bytes=%llu vec=%llu row=%d big=%d failed=%d out=%d in=%d\n",
+                g_cuda_tp_rank, layer, rows, (unsigned long long)bytes,
+                (unsigned long long)s->vec_bytes,
+                s->row != NULL, s->big != NULL,
+                s->failed, out_t != NULL, in_t != NULL);
     }
-    if (!g_cuda_tp.row || !g_cuda_tp.big || g_cuda_tp.failed || !out_t || !in_t ||
-        !rows || bytes != (uint64_t)rows * g_cuda_tp.vec_bytes ||
+    if (!s->row || !s->big || s->failed || !out_t || !in_t ||
+        !rows || bytes != (uint64_t)rows * s->vec_bytes ||
         bytes > SIZE_MAX / 2 || bytes > out_t->bytes || bytes > in_t->bytes) return 0;
-    if (bytes > g_cuda_tp.staging_bytes) {
-        if (g_cuda_tp.staging) (void)cudaFreeHost(g_cuda_tp.staging);
-        g_cuda_tp.staging = NULL;
-        g_cuda_tp.staging_bytes = 0;
-        if (!cuda_ok(cudaHostAlloc(&g_cuda_tp.staging, (size_t)bytes * 2,
+    if (bytes > s->staging_bytes) {
+        if (s->staging) (void)cudaFreeHost(s->staging);
+        s->staging = NULL;
+        s->staging_bytes = 0;
+        if (!cuda_ok(cudaHostAlloc(&s->staging, (size_t)bytes * 2,
                                    cudaHostAllocDefault), "TP bulk staging")) {
-            g_cuda_tp.failed = true;
+            s->failed = true;
             return 0;
         }
-        g_cuda_tp.staging_bytes = bytes;
+        s->staging_bytes = bytes;
     }
-    void *peer = (char *)g_cuda_tp.staging + g_cuda_tp.staging_bytes;
+    void *peer = (char *)s->staging + s->staging_bytes;
     const int ok = cuda_ok(cudaStreamSynchronize(cuda_decode_stream()), "TP bulk arrival") &&
-        ds4_gpu_tensor_read(out_t, 0, g_cuda_tp.staging, bytes) &&
-        g_cuda_tp.big(g_cuda_tp.ud, layer, ++g_cuda_tp.batch_seq,
-                      g_cuda_tp.staging, peer, bytes) &&
+        ds4_gpu_tensor_read(out_t, 0, s->staging, bytes) &&
+        s->big(s->ud, layer, ++s->batch_seq,
+               s->staging, peer, bytes) &&
         ds4_gpu_tensor_write(in_t, 0, peer, bytes);
-    if (!ok) g_cuda_tp.failed = true;
+    if (!ok) s->failed = true;
     return ok;
 }
 
@@ -34076,7 +34090,7 @@ extern "C" void ds4_gpu_tp_keepalive_pause(int paused) {
     (void)paused;
 }
 
-extern "C" int ds4_gpu_tp_failed(void) { return g_cuda_tp.failed; }
+extern "C" int ds4_gpu_tp_failed(void) { return cuda_tp_this()->failed; }
 
 extern "C" void ds4_gpu_model_residency_skip(int skip) {
     (void)skip;
