@@ -1874,6 +1874,26 @@ requires updating all peers together, including Metal peers.
   run, and that exit terminates both ranks (`pgrep -f ds4` is empty when
   the leader exits — there is no separate worker process to leave behind).
 
+  **Validated 2026-09-18** on a two-GPU host (2x NVIDIA RTX PRO 6000
+  Blackwell sm_120, CUDA 13.2, `DeepSeek-V4.1-Flash-Abliterated-Q2-imatrix`,
+  340.6 GiB): `./tests/test_tp_local`, `test_tp_commands`,
+  `test_deepseek41_cuda` (V4.1 TP kernel parity) and
+  `test_gpu_lookup_cache_strict` (2-device) all pass; the full engine pair
+  binds over the LOCAL transport (`worker rank running in this process on
+  device 1 (leader device 0)`), prefills and generates, and the CLI output
+  is **byte-identical** to the single-GPU `--ssd-streaming` reference for
+  the same prompt (0 errors). Generation on the pair: ~32-37 t/s for the
+  Q2 254B model; single-GPU SSD reference was disk-bound (~2.5 t/s).
+  `ds4-server` batched completions also succeed. Earlier blockers fixed
+  during the run: the legacy optional-model-cache accelerator duplicated
+  the per-device strict slabs and OOM'd (skipped when `g_n_gpus >= 2`);
+  the packer charged full expert + Engram bytes to each rank's budget
+  (now halved / excluded, mirroring the accelerator's span rules); the
+  gate service was per-thread TLS so the server's request handlers had no
+  callbacks (now per-rank with a rank-local selector); socketpair buffers
+  enlarged to 16 MiB and the prefill grace extended to 60 s for the LOCAL
+  transport.
+
 - Score general100, boundary17, medium continued12 and long continued9
   against the saved V4.1 API continuations. Include 32-token appends at
   sparse 8/16/32K frontiers. Compare paired case scores, not just coherent
