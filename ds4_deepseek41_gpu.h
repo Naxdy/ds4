@@ -35,6 +35,9 @@ int ds4_gpu_dsv41_shared_start(
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint32_t width, uint32_t hidden, float clamp);
 int ds4_gpu_dsv41_shared_join(void);
+/* Release this thread's shared-expert stream/events/scratch (per-thread
+ * state; the in-process V4.1 TP worker thread owns its own device). */
+void ds4_gpu_dsv41_shared_thread_cleanup(void);
 #endif
 /* Full-head prefill, with BF16 rounding between the two Q8 projections. */
 int ds4_gpu_dsv41_attention_output_batch(

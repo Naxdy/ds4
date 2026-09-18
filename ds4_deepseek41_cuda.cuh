@@ -71,6 +71,14 @@ extern "C" int ds4_gpu_dsv41_shared_join(void) {
     return ok;
 }
 
+/* Release THIS thread's shared-expert stream/events/scratch. The shared
+ * expert state is per-thread (each in-process V4.1 TP rank owns its own
+ * device and stream); ds4_gpu_cleanup only frees the main thread's copy,
+ * so the mirrored worker thread calls this before exiting. */
+extern "C" void ds4_gpu_dsv41_shared_thread_cleanup(void) {
+    cuda_dsv41_shared_free();
+}
+
 extern "C" int ds4_gpu_dsv41_shared_start(
         ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
         ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,

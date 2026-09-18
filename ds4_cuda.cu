@@ -355,6 +355,12 @@ static void cuda_decode_dispatch_env_refresh(void) {
         if (cudaGetDevice(&_wd_prev) != cudaSuccess) { /* leave */ } else   \
         if (cudaSetDevice(d)           != cudaSuccess) { /* leave */ } else
 
+/* Maps the current CUDA device to its logical tier (g_gpu index). Used by
+ * a few allocation helpers that must place buffers on the caller's own
+ * device in the in-process V4.1 TP layout. Defined later; declared here for
+ * early callers. */
+static int cuda_current_tier(void);
+
 /* =========================================================================
  * Per-device selective model cache (selective model cache).
  *
@@ -675,8 +681,13 @@ static inline uint64_t tt_align256_u64(uint64_t x) {
  * Added for multi-GPU execution (multi-GPU execution), step A3 of the
  * spec (sub-area 2). */
 /* Scalar Q8 shared-expert work may run beside the routed experts. Its
- * activation quantization must not reuse the main stream's scratch. */
-static struct {
+ * activation quantization must not reuse the main stream's scratch.
+ *
+ * Per-thread: under in-process V4.1 tensor parallelism each rank's engine
+ * runs on its own thread and device, and BOTH ranks execute the (replicated)
+ * shared expert concurrently. A thread-local copy keeps each rank's stream,
+ * events and scratch bound to its own device. */
+static thread_local struct {
     cudaStream_t stream;
     cudaEvent_t ready, done;
     void *scratch;
@@ -686,7 +697,8 @@ static const uint64_t CUDA_DSV41_SHARED_SCRATCH = 65536u;
 
 static void *cuda_tmp_alloc_on(int logical_tier, uint64_t bytes, const char *what) {
     if (g_dsv41_shared.active)
-        return logical_tier == 0 && bytes <= CUDA_DSV41_SHARED_SCRATCH
+        return logical_tier == cuda_current_tier() &&
+               bytes <= CUDA_DSV41_SHARED_SCRATCH
             ? g_dsv41_shared.scratch : NULL;
     if (bytes == 0) return NULL;
     if (g_n_gpus <= 1) {
@@ -2870,6 +2882,19 @@ extern "C" int ds4_gpu_init(void) {
     memset(&cfg, 0, sizeof(cfg));
     cfg.device_indices[0] = g_init_device;
     cfg.n_gpus = 1;
+
+    /* In-process V4.1 tensor parallelism opens both GPUs with ONE
+     * ds4_gpu_init_multi call in the leader; the mirrored worker thread
+     * re-enters here through its own engine open with a one-GPU config
+     * naming the second device. Do not rebuild g_gpu[] (that would
+     * clobber the leader's tier 0 context); instead select the already
+     * initialized tier that owns the requested physical device. */
+    for (int i = 0; i < g_n_gpus; i++) {
+        if (g_gpu[i].device_id == cfg.device_indices[0]) {
+            return cuda_ok(cudaSetDevice(cfg.device_indices[0]),
+                           "set device (already initialized)") ? 1 : 0;
+        }
+    }
     return ds4_gpu_init_multi(&cfg);
 }
 
@@ -3060,7 +3085,11 @@ extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) {
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
-    if (ds4_gpu_tensor_alloc_on(t, 0, bytes) != 0) {
+    /* Allocate on the CURRENT logical tier so the in-process V4.1 TP
+     * worker thread (pinned to tier 1) places its graph and session
+     * buffers on the second GPU while the leader stays on tier 0.
+     * Single-tier operation is unchanged: tier is always 0. */
+    if (ds4_gpu_tensor_alloc_on(t, cuda_current_tier(), bytes) != 0) {
         free(t);
         return NULL;
     }
@@ -3069,19 +3098,22 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
+    const int tier = cuda_current_tier();
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
     int ok = 0;
-    /* Managed memory is not device-bound, but we record device 0 so that
-     * subsequent ds4_gpu_tensor_free pairs with WITH_DEVICE(0) safely. */
-    WITH_DEVICE(g_gpu[0].device_id) {
+    /* Managed memory is not device-bound, but we record the current tier
+     * so that subsequent ds4_gpu_tensor_free pairs with the right device
+     * and per-device accounting is accurate. The in-process V4.1 TP
+     * worker thread allocates its session/KV buffers on tier 1. */
+    WITH_DEVICE(g_gpu[tier].device_id) {
         ok = cuda_ok(cudaMallocManaged(&t->ptr, (size_t)bytes),
                      "managed tensor alloc");
     }
     if (!ok) { free(t); return NULL; }
     t->bytes = bytes;
     t->owner = 1;
-    t->device_id = 0;
+    t->device_id = tier;
     return t;
 }
 
@@ -27592,7 +27624,15 @@ __device__ __forceinline__ static void glm_rope_yarn_dev(
 static int cuda_current_tier(void) {
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return 0;
-    return dev;
+    /* Physical device ids need not equal logical tier indices when a
+     * subset of GPUs is selected (e.g. --gpu-devices 1 opens physical 1).
+     * The in-process V4.1 TP worker thread stays pinned to tier 1 while
+     * the leader owns tier 0 in the same process, so the mapping must be
+     * by identity, never by assumption of index == id. */
+    for (int i = 0; i < g_n_gpus; i++) {
+        if (g_gpu[i].device_id == dev) return i;
+    }
+    return 0;
 }
 
 /* ===== GLM 5.2 stubs (to be implemented; fail loudly) ===== */
@@ -33623,7 +33663,12 @@ extern "C" int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *te
                    "selected tensor read");
 }
 
-static struct {
+/* Per-thread TP gate service state. In the in-process V4.1 tensor
+ * parallelism the leader engine's gates and the mirrored worker engine's
+ * gates run on TWO threads of the same process (each pinned to its own
+ * CUDA device); the exchange callbacks, sequence counters and bulk
+ * staging must never be shared between them. */
+static thread_local struct {
     ds4_gpu_tp_exchange_fn row;
     ds4_gpu_tp_batch_exchange_fn batch;
     ds4_gpu_tp_big_exchange_fn big;

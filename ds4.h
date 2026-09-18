@@ -111,6 +111,7 @@ typedef enum {
     DS4_TP_TRANSPORT_AUTO = 0,
     DS4_TP_TRANSPORT_RDMA,
     DS4_TP_TRANSPORT_TCP,
+    DS4_TP_TRANSPORT_LOCAL,   /* in-process socketpair twin (V4.1 --cuda-tensor-parallel) */
 } ds4_tp_transport;
 
 typedef struct {
@@ -126,6 +127,9 @@ typedef struct {
     bool rdma_gid_index_set;
     bool glm_token_prefill;
     int debug_hash;             /* cross-check hidden state every N tokens */
+    int local;                  /* in-process twin: use local_ctl_fd/local_data_fd */
+    int local_ctl_fd;           /* this endpoint's control socket fd (LOCAL) */
+    int local_data_fd;          /* this endpoint's data socket fd (LOCAL) */
 } ds4_tp_options;
 
 typedef struct {
@@ -174,6 +178,11 @@ typedef struct {
     uint32_t load_layer_start;
     uint32_t load_layer_end;
     bool load_output;
+    /* In-process V4.1 tensor parallelism: the mirrored worker engine lives
+     * in the leader's process. Its engine_close must free only its own
+     * allocations; the CUDA context, thread pool and g_gpu[] teardown is
+     * performed once by the leader's engine_close. */
+    bool defer_shared_gpu_teardown;
     ds4_distributed_options distributed;
     ds4_tp_options tp;
 } ds4_engine_options;

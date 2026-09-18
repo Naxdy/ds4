@@ -1093,3 +1093,9 @@ clean:
 
 # The active tokenizer includes generated Unicode classes.
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc
+
+tests/test_tp_local.o: tests/test_tp_local.c ds4_tp.c ds4_tp.h ds4.h ds4_gpu_tp.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_tp_local: tests/test_tp_local.o $(filter-out ds4_tp.o,$(CPU_CORE_OBJS))
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)

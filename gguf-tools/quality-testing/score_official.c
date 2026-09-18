@@ -789,11 +789,10 @@ int main(int argc, char **argv) {
 
     ds4_engine *engine = NULL;
     /* In-process V4.1 tensor parallelism (--cuda-tensor-parallel with two
-     * CUDA devices) runs each rank as its own single-GPU process. */
+     * CUDA devices) runs the mirrored worker rank as a thread of this
+     * process (its own engine pinned to the second GPU). */
     bool local_tp_active = false;
-    char tp_worker_devices[32] = {0};
-    char tp_worker_vram_buf[32] = {0};
-    const char *tp_worker_vram = "auto";
+    ds4_gpu_config local_pair_cfg = {0};
     if (gpu_vram_arg || gpu_devices_arg) {
 #ifdef __APPLE__
         die("score_official: CUDA GPU placement is unavailable on macOS");
@@ -813,13 +812,7 @@ int main(int argc, char **argv) {
         if (cuda_tensor_parallel && gpu_cfg.n_gpus == 2 &&
             gpu_cfg.device_indices[0] != gpu_cfg.device_indices[1]) {
             local_tp_active = true;
-            snprintf(tp_worker_devices, sizeof(tp_worker_devices), "%d",
-                     gpu_cfg.device_indices[1]);
-            if (gpu_vram_arg && strcmp(gpu_vram_arg, "auto") != 0) {
-                snprintf(tp_worker_vram_buf, sizeof(tp_worker_vram_buf),
-                         "%zu", gpu_cfg.vram_bytes[1] / UINT64_C(1073741824));
-                tp_worker_vram = tp_worker_vram_buf;
-            }
+            local_pair_cfg = gpu_cfg;
         }
         if (ds4_engine_create_with_gpu_config(&engine, &opt, &gpu_cfg) != 0) {
             die("failed to open model");
@@ -858,10 +851,9 @@ int main(int argc, char **argv) {
         atexit(stop_tp_at_exit);
     } else if (local_tp_active) {
         char local_err[256] = "";
-        const int local_rc = ds4_tp_local_leader_bind(
-                engine, &tp,
-                tp_worker_devices, tp_worker_vram,
-                argc, argv, &exit_tp, local_err, sizeof(local_err));
+        const int local_rc = ds4_tp_local_pair_bind(
+                engine, &local_pair_cfg, &opt, &tp,
+                &exit_tp, local_err, sizeof(local_err));
         if (local_rc < 0) {
             fprintf(stderr, "score_official: %s\n", local_err);
             close_engine(engine);

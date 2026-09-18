@@ -104,23 +104,32 @@ void ds4_tp_free(ds4_tp *tp);
 /* In-process CUDA tensor parallelism (DeepSeek V4.1 Flash on a two-GPU
  * host).  A leader frontend calls this instead of creating its own network
  * transport when --cuda-tensor-parallel requested exactly two CUDA devices:
- * it picks a loopback port, spawns this same binary as the worker rank
- * (second GPU, --role worker, --cuda-tensor-parallel removed) and binds the
- * engine to the resulting leader transport, reusing the standard two-process
- * TP protocol verbatim.  Returns 1 on success (engine bound, *tp set; the
- * child is reaped by ds4_tp_free), 0 when this does not apply (caller keeps
- * its existing path), -1 on failure (err filled).  The helper overrides
- * `requested`'s role to LEADER; only its transport/rdma settings are reused,
- * so callers must not set a role themselves. */
-int ds4_tp_local_leader_bind(ds4_engine *engine,
-                             const ds4_tp_options *requested,
-                             const char *worker_devices_arg,
-                             const char *worker_vram_arg,
-                             int argc, char **argv,
-                             ds4_tp **tp, char *err, size_t errlen);
+ * it pairs the two GPUs inside THIS process (the worker rank runs as a
+ * thread with its own engine pinned to the second device) and exchanges
+ * every gate and command over a socketpair — no fork, no exec, no loopback
+ * network, no coordinator role.  The existing lockstep TP protocol is
+ * reused verbatim.
+ *
+ * `engine` is the already-open leader engine (rank 0, device
+ * gpu_cfg->device_indices[0]); gpu_cfg must name exactly two distinct CUDA
+ * devices.  `worker_engine_options` is a copy of the leader engine options
+ * used to open the mirrored worker engine on gpu_cfg->device_indices[1]
+ * (its tp.role is forced to WORKER by this function).  Returns 1 on success
+ * (engine bound, *tp set; the worker thread is joined by ds4_tp_free), 0
+ * when this does not apply (caller keeps its existing path), -1 on failure
+ * (err filled).  The helper overrides `requested`'s role to LEADER; only
+ * its transport/debug settings are reused, so callers must not set a role
+ * themselves. */
+int ds4_tp_local_pair_bind(ds4_engine *engine,
+                           const struct ds4_gpu_config *gpu_cfg,
+                           const ds4_engine_options *worker_engine_options,
+                           const ds4_tp_options *requested,
+                           ds4_tp **tp, char *err, size_t errlen);
 
 int ds4_tp_rank(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
+/* Human-readable transport name: "rdma", "tcp" or "local" (in-process twin). */
+const char *ds4_tp_transport_name(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);

@@ -1852,8 +1852,8 @@ requires updating all peers together, including Metal peers.
   the control must mirror scalar execution on the worker as well.
 - **In-process V4.1 CUDA TP.** On a two-GPU host (build `make cuda
   CUDA_ARCH=sm_120`, `./download_model.sh ds41f-q2`), require the leader
-  frontend alone to spawn the paired worker and agree with the network
-  pair:
+  frontend alone to pair both GPUs inside this single process and agree
+  with the network pair:
   ```sh
   # CLI parity vs a single-GPU rank (both against the same Q2 GGUF):
   ./ds4 --cuda --gpu-devices 0,1 --gpu-vram auto --cuda-tensor-parallel \
@@ -1865,14 +1865,14 @@ requires updating all peers together, including Metal peers.
   ./ds4-agent --cuda --cuda-tensor-parallel --gpu-devices 0,1 --gpu-vram auto \
     --ctx 16384 --non-interactive -p "Plan." -n 24
   ```
-  The leader prints `ds4-tp: in-process V4.1 TP: worker rank spawned
-  (pid %ld) on device N` and binds a loopback transport; the worker is a
-  normal `--role worker` process, so it must pass every gate the network
-  pair does (RQ8-Q2 experts, no quality mode). Verify full-vocab logits,
-  session create/destroy, prefill chunking, cancellation and snapshots
-  agree with the two-machine run, and that Ctrl-C + immediate Ctrl-C
-  terminate both ranks without leaving a worker behind (`pgrep -f
-  "gpu-devices 1"` is empty when the leader exits).
+  The leader prints `ds4-tp: in-process V4.1 TP: worker rank running in
+  this process on device N (leader device M)` and binds a socketpair
+  transport; the worker is a thread of the same process, so it must pass
+  every gate the network pair does (IQ2_XXS gate/up + Q2_K down experts,
+  no quality mode). Verify full-vocab logits, session create/destroy,
+  prefill chunking, cancellation and snapshots agree with the two-machine
+  run, and that exit terminates both ranks (`pgrep -f ds4` is empty when
+  the leader exits — there is no separate worker process to leave behind).
 
 - Score general100, boundary17, medium continued12 and long continued9
   against the saved V4.1 API continuations. Include 32-token appends at

@@ -93,13 +93,15 @@ environment tuning. See [serving](SERVER.md) for disk caches and API access.
 
 `--cuda-tensor-parallel` also works for **DeepSeek V4.1 Flash** on a single
 two-GPU host (e.g. a Blackwell DB/GB pair). Unlike the Flash (DeepSeek V4)
-placement mode above, V4.1 keeps each rank on **exactly one GPU**: instead of
-splitting layers across devices, the pair runs the proven network-TP
-protocol in-process — the leader frontend (ds4, ds4-server, ds4-agent,
-ds4-bench) spawns a worker process for the second GPU with the same model and
-options, connects them over loopback TCP, and reaps the worker at exit. The
-worker is a normal `--role worker` process; there is nothing to configure
-manually.
+placement mode above, V4.1 keeps each rank on **exactly one GPU** in a
+genuinely single-process configuration: no child process, no exec, no
+loopback network, no coordinator role. The leader frontend (ds4, ds4-server,
+ds4-agent, ds4-bench) initializes both CUDA devices in this one process, runs
+rank 0 on the first device, and mirrors rank 1 as a thread of the same
+process on the second device. Every gate exchange and lockstep command
+travels over an in-process socketpair; the proven two-rank protocol is
+reused verbatim, so the two ranks are behaviorally identical to a
+machine-to-machine `--tensor-parallel` pair.
 
 ```sh
 ./ds4-agent --cuda --cuda-tensor-parallel \
@@ -110,22 +112,23 @@ manually.
   --batched-session 16 --host 0.0.0.0
 ```
 
-Requirements and semantics match the QA'd [network V4.1 TP](../docs/DISTRIBUTED.md)
-path — the two ranks are bit-identical to a machine-to-machine pair:
+Requirements and semantics match the QA'd network V4.1 TP path:
 
 - Exactly **two** CUDA devices are accepted (`--gpu-devices` is optional; an
-  explicit `--gpu-vram` budget for device 1 is honored, otherwise each worker
-  auto-detects its own free VRAM on the second card).
+  explicit `--gpu-vram` budget for device 1 is honored, otherwise each rank
+  auto-detects its own free VRAM on its card). The first listed device is
+  rank 0, the second is rank 1. Device order does not imply pairing layers —
+  both ranks run the complete layer stack on their own GPU.
 - The routed experts must be IQ2_XXS gate/up and Q2_K down (the V4.1 Q2
-  recipe). Dense/shared weights replicate on both ranks; each rank maps only
-  its own contiguous expert shard, and the output head is vocabulary-split.
+  recipe). Dense/shared weights replicate on both ranks; each rank's weights
+  live only on its own device, and the output head is vocabulary-split.
 - Quality mode (`--quality`), SSD streaming, DSpark and steering remain
   unsupported under TP, exactly as in the network configuration.
-- The worker's logs appear on the same terminal (it is this process family);
-  shutdown sends STOP, waits 2 s, then terminates and reaps the worker so an
-  orphaned child can never block or leak.
+- Both ranks' logs appear on the same terminal (it is one process); shutdown
+  closes the transport and joins the worker thread, so no orphaned process
+  or zombie can be left behind.
 
 The 2048-token prefill chunk note above does not apply: V4.1 prefill is
-driven by the leader and chunked internally, so leader/worker context sizes
-may differ without desyncing.
+driven by the leader and chunked identically on both ranks, so the leader
+and worker never desync over differing chunk settings.
 

@@ -42280,6 +42280,9 @@ struct ds4_engine {
     bool dspark_exact_sampling;
     bool cuda_tensor_parallel;
     bool glm_tp_token_prefill;
+    /* Mirrored in-process TP worker engine: close frees only its own
+     * allocations; CUDA/thread-pool teardown is the leader's once. */
+    bool defer_shared_gpu_teardown;
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
@@ -60097,6 +60100,10 @@ static void ds4_release_instance_lock(void) {
 /* Refuse to start a second ds4 process.  The model can map tens of GiB, so a
  * stale accidental second run is more dangerous than a normal CLI error. */
 static void ds4_acquire_instance_lock(void) {
+    /* The in-process V4.1 TP worker thread opens its own engine in THIS
+     * process; a second flock on a fresh fd would see our own lock and
+     * abort. flock is per open-file-description, so skip once held. */
+    if (g_ds4_lock_fd >= 0) return;
     const char *path = getenv("DS4_LOCK_FILE");
     if (!path || !path[0]) path = "/tmp/ds4.lock";
 
@@ -69636,6 +69643,60 @@ static int engine_append_device_cache_range(
                                            t->abs_offset, t->bytes);
 }
 
+/* In-process V4.1 TP weight residency.
+ *
+ * With g_n_gpus >= 2 every V4.1 kernel resolves weight slices through the
+ * strict per-device cache (cuda_resolve_weight_ptr has NO host-pointer
+ * fallback in multi-GPU mode), so BOTH devices must hold exactly the spans
+ * their rank touches: the replicated dense/static tensors plus that rank's
+ * contiguous routed-expert half. weights_model_map_sharded_spans produces
+ * precisely this per-rank layout (the same builder the two-machine TP path
+ * maps per rank), so we translate its spans into per-device cache ranges
+ * and install both within this one process. */
+static int engine_install_v41_tp_caches(ds4_engine *e,
+                                        const ds4_gpu_config *gpu_cfg) {
+    if (!e || !gpu_cfg || gpu_cfg->n_gpus != 2) return -1;
+    /* Prereq for ds4_gpu_device_cache_tensors: g_model_host_base must be
+     * resolved (see engine_install_per_device_caches). */
+    if (!ds4_gpu_register_model_map_no_copy(e->model.map, e->model.size)) {
+        fprintf(stderr, "ds4: V4.1 TP model map registration failed\n");
+        return -1;
+    }
+    for (int rank = 0; rank < (int)gpu_cfg->n_gpus; rank++) {
+        ds4_model_map_span_vec spans;
+        if (!weights_model_map_sharded_spans(&e->weights, &e->model,
+                                             rank, &spans)) {
+            fprintf(stderr, "ds4: V4.1 TP sharded span build failed (rank %d)\n",
+                    rank);
+            return -1;
+        }
+        const int physical_device = g_gpu[rank].device_id;
+        ds4_tensor_range *ranges = xmalloc((size_t)spans.len * sizeof(*ranges));
+        uint32_t n = 0;
+        uint64_t cache_bytes = 0;
+        for (uint32_t i = 0; i < spans.len; i++) {
+            const uint64_t off = spans.v[i].off;
+            const uint64_t bytes = spans.v[i].end - off;
+            if (bytes == 0) continue;
+            ranges[n].source_offset = off;
+            ranges[n].bytes = bytes;
+            ranges[n].target_device = physical_device;
+            if (cache_bytes <= UINT64_MAX - bytes) cache_bytes += bytes;
+            n++;
+        }
+        const int rc = ds4_gpu_device_cache_tensors(
+                physical_device, ranges, (int)n);
+        fprintf(stderr,
+                "ds4: V4.1 TP rank %d device %d weights: %.2f GiB in %u ranges%s\n",
+                rank, physical_device, (double)cache_bytes / 1073741824.0,
+                n, rc != 0 ? " (install failed)" : "");
+        free(ranges);
+        free(spans.v);
+        if (rc != 0) return -1;
+    }
+    return 0;
+}
+
 /* Install per-device selective caches for GPU-placed tensors. Skips any
  * tensor whose entry is placed on CPU — that case must be rejected at a
  * higher level for this PR (execution wiring not yet shipped). */
@@ -70455,6 +70516,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->dspark = opt->dspark;
     e->dspark_strict = opt->dspark_strict;
     e->dspark_exact_sampling = opt->dspark_exact_sampling;
+    e->defer_shared_gpu_teardown = opt->defer_shared_gpu_teardown;
     e->cuda_tensor_parallel = opt->cuda_tensor_parallel;
     e->glm_tp_token_prefill = opt->tp.glm_token_prefill;
     e->ssd_streaming = opt->ssd_streaming;
@@ -70613,9 +70675,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
             (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
             e->power_percent == 100 && opt->context_size <= 1048576;
         if (!supported) {
-            fprintf(stderr, "ds4: V4.1 requires Metal or single-GPU CUDA per rank (optional network or in-process "
-                            "two-GPU tensor parallelism); DSpark, steering and legacy diagnostics are "
-                            "not supported (maximum context 1048576)\n");
+            fprintf(stderr, "ds4: V4.1 requires Metal or single-GPU CUDA per rank (or in-process "
+                            "two-GPU CUDA tensor parallelism via --cuda-tensor-parallel); "
+                            "DSpark, steering and legacy diagnostics are not supported (maximum context 1048576)\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -70761,9 +70823,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
      * rank owns (replicated dense weights plus its expert shard). */
 #ifndef DS4_NO_GPU
     /* In-process V4.1 TP (--cuda-tensor-parallel with exactly two CUDA
-     * devices) runs each rank as its own single-GPU process.  The leader
-     * takes the same sharded-weight layout as a network TP leader: dense
-     * weights replicated, one contiguous routed-expert half on disk. */
+     * devices) runs both ranks in THIS process (the mirrored worker engine
+     * lives on the second device).  The leader takes the same sharded-weight
+     * layout as a network TP leader: dense weights replicated, one
+     * contiguous routed-expert half per device/rank. */
     const bool v41_local_tp =
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
         opt->cuda_tensor_parallel &&
@@ -71268,18 +71331,39 @@ static int ds4_engine_open_internal(ds4_engine **out,
         /* Single-tier path (every existing caller). Body is byte-equivalent
          * to pre-multi-GPU CLI main. */
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-        /* The in-process V4.1 tensor-parallel rank is a single-GPU process:
-         * the worker opens the second listed device through this init, and
-         * the leader opens exactly the first listed device after the local
-         * rank was redirected to the single-device path. */
-        if (gpu_cfg &&
-            (gpu_cfg->n_gpus == 1 ||
-             (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
-              opt->cuda_tensor_parallel && gpu_cfg->n_gpus == 2))) {
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+            e->backend == DS4_BACKEND_CUDA && opt->cuda_tensor_parallel &&
+            gpu_cfg && gpu_cfg->n_gpus == 2 &&
+            gpu_cfg->device_indices[0] != gpu_cfg->device_indices[1]) {
+            /* In-process V4.1 tensor parallelism: initialize BOTH devices up
+             * front in this single process.  The leader engine executes on
+             * tier 0; the mirrored worker thread re-enters ds4_gpu_init with
+             * a one-device config naming the second GPU, which the
+             * idempotent shim routes to the already-initialized tier instead
+             * of rebuilding g_gpu[] (which would clobber the leader's
+             * context). */
+            e->metal_ready = ds4_gpu_init_multi(gpu_cfg) != 0;
+            if (e->metal_ready) {
+                /* init_multi leaves the current device on the last tier;
+                 * the leader's model-map setup below must run on tier 0. */
+                if (ds4_gpu_set_current_device(0) != 0) e->metal_ready = 0;
+            }
+            /* With two devices initialized every V4.1 kernel resolves its
+             * weights through the strict per-device cache; install both
+             * ranks' sharded spans now so no lookup can miss later. */
+            if (e->metal_ready &&
+                engine_install_v41_tp_caches(e, gpu_cfg) != 0) {
+                e->metal_ready = 0;
+            }
+        } else if (gpu_cfg) {
             ds4_gpu_set_preferred_device(gpu_cfg->device_indices[0]);
+            e->metal_ready = ds4_gpu_init() != 0;
+        } else {
+            e->metal_ready = ds4_gpu_init() != 0;
         }
-#endif
+#else
         e->metal_ready = ds4_gpu_init() != 0;
+#endif
         if (!e->metal_ready) {
             fprintf(stderr, "ds4: %s backend unavailable; aborting startup\n",
                     ds4_backend_name(e->backend));
@@ -72603,7 +72687,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     e->tp.active = true;
     ds4_log(stderr, DS4_LOG_OK,
             "tensor parallelism bound: rank %d, 50/50 expert split, %s transport",
-            e->tp.rank, ds4_tp_is_rdma(tp) ? "rdma" : "tcp");
+            e->tp.rank, ds4_tp_transport_name(tp));
     return 1;
 fail:
     ds4_engine_tp_unbind(e);
@@ -72657,7 +72741,9 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_expert_profile_close();
     weights_free(&e->weights);
     vocab_free(&e->vocab);
-    ds4_threads_shutdown();
+    /* The mirrored in-process TP worker shares the leader's pool; only the
+     * leader tears it down. */
+    if (!e->defer_shared_gpu_teardown) ds4_threads_shutdown();
     if (e->mtp_model.map) model_close(&e->mtp_model);
     if (e->vision_model.map) model_close(&e->vision_model);
     model_close(&e->model);
@@ -72674,7 +72760,11 @@ void ds4_engine_close(ds4_engine *e) {
         metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
         e->shared_prefill_workspace_ready = false;
     }
-    ds4_gpu_cleanup();
+    if (!e->defer_shared_gpu_teardown) {
+        /* Only the leader owns the shared CUDA context / thread pool; the
+         * mirrored in-process TP worker defers this teardown to it. */
+        ds4_gpu_cleanup();
+    }
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();

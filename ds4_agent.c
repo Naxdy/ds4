@@ -13530,11 +13530,10 @@ int main(int argc, char **argv) {
     cfg.engine.context_size = cfg.gen.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
     /* In-process V4.1 tensor parallelism (--cuda-tensor-parallel with two
-     * CUDA devices) runs each rank as its own single-GPU process. */
+     * CUDA devices) runs the mirrored worker rank as a thread of this
+     * process (its own engine pinned to the second GPU). */
     bool local_tp_active = false;
-    char tp_worker_devices[32] = {0};
-    char tp_worker_vram_buf[32] = {0};
-    const char *tp_worker_vram = "auto";
+    ds4_gpu_config local_pair_cfg = {0};
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         cfg.engine.backend = cfg.gpu_vram_arg &&
                              !strcmp(cfg.gpu_vram_arg, "0")
@@ -13569,13 +13568,7 @@ int main(int argc, char **argv) {
             if (cfg.engine.cuda_tensor_parallel && gpu_cfg.n_gpus == 2 &&
                 gpu_cfg.device_indices[0] != gpu_cfg.device_indices[1]) {
                 local_tp_active = true;
-                snprintf(tp_worker_devices, sizeof(tp_worker_devices), "%d",
-                         gpu_cfg.device_indices[1]);
-                if (cfg.gpu_vram_arg && strcmp(cfg.gpu_vram_arg, "auto") != 0) {
-                    snprintf(tp_worker_vram_buf, sizeof(tp_worker_vram_buf),
-                             "%zu", gpu_cfg.vram_bytes[1] / UINT64_C(1073741824));
-                    tp_worker_vram = tp_worker_vram_buf;
-                }
+                local_pair_cfg = gpu_cfg;
             }
             if (ds4_engine_create_with_gpu_config(
                     &engine, &cfg.engine, &gpu_cfg) != 0) return 1;
@@ -13616,10 +13609,9 @@ int main(int argc, char **argv) {
         }
     } else if (local_tp_active) {
         char tp_err[256] = "";
-        const int local_rc = ds4_tp_local_leader_bind(
-                engine, &cfg.engine.tp,
-                tp_worker_devices, tp_worker_vram,
-                argc, argv, &tp_leader, tp_err, sizeof(tp_err));
+        const int local_rc = ds4_tp_local_pair_bind(
+                engine, &local_pair_cfg, &cfg.engine, &cfg.engine.tp,
+                &tp_leader, tp_err, sizeof(tp_err));
         if (local_rc < 0) {
             fprintf(stderr, "ds4-agent: %s\n", tp_err);
             ds4_tp_free(tp_leader);
