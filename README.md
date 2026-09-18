@@ -165,7 +165,9 @@ requirements. DeepSeek Vision Experimental uses a different checkpoint from
 Flash 0731; GLM 5.3 Flash and Qwen3.8 Flash Next add vision to the same text
 model through a separate encoder.
 
-DeepSeek V4.1 Flash text and vision run on Metal; text also runs on a DGX Spark.
+DeepSeek V4.1 Flash text and vision run on Metal; text also runs on CUDA
+(single GPU with SSD streaming, or single-process two-GPU in-process tensor
+parallelism via `--cuda-tensor-parallel`, including Blackwell sm_120).
 Q2 runs with SSD streaming on one 128 GB Mac or Spark, or resident across two
 Macs or two Sparks using RDMA. Q4 needs SSD streaming or a 512 GB Mac.
 Engram tables remain on disk in every mode, so use a fast
