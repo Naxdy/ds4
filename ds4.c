@@ -69157,7 +69157,8 @@ static bool engine_deepseek_routed_expert_tensor(
         int               entry,
         uint64_t         *expert_bytes) {
     if (!e || !t || entry < 1 || entry > (int)DS4_N_LAYER ||
-        g_ds4_shape.family != DS4_MODEL_FAMILY_DEEPSEEK4 ||
+        (g_ds4_shape.family != DS4_MODEL_FAMILY_DEEPSEEK4 &&
+         g_ds4_shape.family != DS4_MODEL_FAMILY_DEEPSEEK41) ||
         DS4_N_EXPERT == 0u || (DS4_N_EXPERT & 1u) != 0u) {
         return false;
     }
@@ -69189,6 +69190,15 @@ static bool engine_cuda_tp_output_env_requested(void);
 static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
     const int n_entries = DS4_N_LAYER + 2;
     const bool cuda_tp_ep = engine_cuda_tp_ep_requested(e);
+    /* In-process V4.1 TP ranks (leader on tier 0 with the flag, mirrored
+     * worker on tier 1) each own only a contiguous routed-expert half, so
+     * their footprint estimates must halve the expert blobs exactly like
+     * DeepSeek V4 Flash TP does, or the budget math spills the whole model
+     * to CPU and refuses to open. */
+    const bool v41_tp_rank =
+        g_ds4_shape.family == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+        e->backend == DS4_BACKEND_CUDA &&
+        (e->cuda_tensor_parallel || e->tp.rank == 1);
     for (int i = 0; i < n_entries; i++) out[i] = 0;
 
     for (uint64_t i = 0; i < e->model.n_tensors; i++) {
@@ -69204,7 +69214,7 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
             continue;
         }
         uint64_t expert_bytes = 0;
-        if (cuda_tp_ep &&
+        if ((cuda_tp_ep || v41_tp_rank) &&
             engine_deepseek_routed_expert_tensor(e, t, entry, &expert_bytes)) {
             out[entry] += expert_bytes * (DS4_N_EXPERT / 2u);
         } else {
@@ -70519,6 +70529,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->defer_shared_gpu_teardown = opt->defer_shared_gpu_teardown;
     e->cuda_tensor_parallel = opt->cuda_tensor_parallel;
     e->glm_tp_token_prefill = opt->tp.glm_token_prefill;
+    /* TP rank known before the placement/budget accounting runs: the
+     * mirrored in-process worker (role WORKER) needs rank 1 for the
+     * sharded-footprint math below; ds4_engine_tp_bind later refreshes
+     * e->tp.rank from the transport, which yields the same value. */
+    e->tp.rank = opt->tp.role == DS4_TP_WORKER ? 1 : 0;
     e->ssd_streaming = opt->ssd_streaming;
     e->ssd_streaming_cold = opt->ssd_streaming_cold;
     e->ssd_streaming_full_layers_set = opt->ssd_streaming_full_layers_set;
