@@ -71775,8 +71775,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
-        if (!accelerator_cache_model_tensors(e->backend, &e->model,
+(void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+        /* In-process V4.1 TP (both ranks in this process, g_n_gpus >= 2):
+         * every kernel resolves weights through the per-device STRICT cache
+         * installed by engine_install_v41_tp_caches, so the legacy optional
+         * model cache below would only duplicate the spans on the current
+         * device and OOM (each rank already holds its ~80 GiB slab). The
+         * network TP pair (one GPU per process) still needs it. */
+        const bool v41_inprocess_tp =
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+            e->backend == DS4_BACKEND_CUDA && g_n_gpus >= 2;
+        if (!v41_inprocess_tp &&
+            !accelerator_cache_model_tensors(e->backend, &e->model,
                                              load_offsets, load_sizes,
                                              load_span_count)) {
             fprintf(stderr, "ds4: %s failed to prepare optional model cache\n",
