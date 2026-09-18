@@ -33725,6 +33725,15 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 
 extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
         const ds4_gpu_tensor *out_t, ds4_gpu_tensor *in_t, uint64_t bytes) {
+    if (getenv("DS4_TP_BIG_GATE_DEBUG") && getenv("DS4_TP_BIG_GATE_DEBUG")[0] == '3' &&
+        (!g_cuda_tp.row || !g_cuda_tp.big || g_cuda_tp.failed || !out_t || !in_t ||
+         !rows || bytes != (uint64_t)rows * g_cuda_tp.vec_bytes)) {
+        fprintf(stderr, "ds4-tp: rank? big encode BAIL l=%u rows=%u bytes=%llu vec=%llu row=%d big=%d failed=%d out=%d in=%d\n",
+                layer, rows, (unsigned long long)bytes,
+                (unsigned long long)g_cuda_tp.vec_bytes,
+                g_cuda_tp.row != NULL, g_cuda_tp.big != NULL,
+                g_cuda_tp.failed, out_t != NULL, in_t != NULL);
+    }
     if (!g_cuda_tp.row || !g_cuda_tp.big || g_cuda_tp.failed || !out_t || !in_t ||
         !rows || bytes != (uint64_t)rows * g_cuda_tp.vec_bytes ||
         bytes > SIZE_MAX / 2 || bytes > out_t->bytes || bytes > in_t->bytes) return 0;

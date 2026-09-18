@@ -40566,6 +40566,10 @@ static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
 
 static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
                                    uint32_t il, uint32_t count) {
+    if (getenv("DS4_TP_BIG_GATE_DEBUG") && getenv("DS4_TP_BIG_GATE_DEBUG")[0] == '3') {
+        fprintf(stderr, "ds4-tp: sum_partial_batch l=%u rows=%u tp_world=%u\n",
+                il, count, g->tp_world);
+    }
     if (g->tp_world != 2) return true;
     /* Q is dead after attention; its expert-output alias is dead after the
      * routed reduction. Reuse it for the peer, without another large buffer. */
