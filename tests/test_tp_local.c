@@ -175,9 +175,15 @@ static void *run_rank(void *arg) {
         ds4_tp_command_free(&cmd);
         assert(ds4_tp_send_command_ack(p->tp, 42, 0));
 
-        /* Worker ships its vocab-split logits half to the leader. */
+        /* Worker ships its vocab-split logits half to the leader, then
+         * stays blocked on the control socket until the leader's STOP
+         * frame — exactly like ds4_tp_worker_run. The leader's STOP write
+         * must never race this thread's transport close. */
         const float half[] = {1.25f, -2.5f, 0.0f, 9.0f};
         assert(ds4_tp_send_logits_half(p->tp, half, 4));
+        assert(ds4_tp_recv_command(p->tp, &cmd, err, sizeof(err)));
+        assert(cmd.type == DS4_TP_FRAME_STOP);
+        ds4_tp_command_free(&cmd);
     }
     p->rc = 1;
     return NULL;
